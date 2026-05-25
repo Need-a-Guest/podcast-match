@@ -458,6 +458,618 @@ header { padding: 20px 40px; display: flex; align-items: center; justify-content
         pmSetMsg("pm-generate-msg", "You have been matched with all available shows. Contact Angel for new additions.");
         if (btn) { btn.disabled = false; btn.textContent = "Generate my matches"; } return;
       }
+      // Randomly sample up to 50 shows to stay within token limits
+      // Sample 40 shows and use compact format to stay within token limits
+      var sampleSize = Math.min(40, available.length);
+      var sampled = available.slice().sort(function() { return Math.random() - 0.5; }).slice(0, sampleSize);
+      var showList = sampled.map(function(s) {
+        var f = s.fields;
+        return (f["Show Name"]||"?") + "|" + (f["Category"]||"?") + "|" + (f["Desired Guests and Conversation Type"]||"?") + "|" + (f["How to Apply Link"]||f["How to Apply"]||"");
+      }).join("\n");
+
+      var prompt = "You are a podcast booking expert working for Angel Tuccy at Need a Guest.\n\nGUEST PROFILE:\n- Topic/niche: "+PM.profile.topic+"\n- Target audience: "+PM.profile.audience+"\n- Credentials/background: "+PM.profile.creds+"\n- Format preferences: "+PM.profile.format+"\n- Additional context: "+PM.profile.other+"\n\nAVAILABLE SHOWS (format: ShowName|Category|DesiredGuests|ApplyLink):\n"+showList+"\n\nSelect exactly 12 shows (or fewer if less than 12 available) that are the best fit. For each, write a warm specific 2-3 sentence explanation of why this guest would be a great fit.\n\nRespond ONLY with a valid JSON array, no markdown, no preamble:\n[{\"showName\":\"...\",\"hostName\":\"...\",\"category\":\"...\",\"downloads\":\"...\",\"applyLink\":\"...\",\"whyFit\":\"...\"}]";
+
+      if (window.PM_TEST) {
+        var fakeMatches = PM_TEST_MATCHES.slice(0, 12);
+        var today2 = new Date().toISOString().split("T")[0];
+        for (var ti = 0; ti < fakeMatches.length; ti++) {
+          var tm = fakeMatches[ti];
+          if (!seenNames.includes(tm.showName)) {
+            PM.history.push({ showName: tm.showName, date: today2, applyLink: tm.applyLink || "" });
+          }
+        }
+        pmLoadDashboard();
+        pmRenderResults(fakeMatches, false);
+        pmShowView("pm-results-view");
+        if (btn) { btn.disabled = false; btn.textContent = "Generate my matches"; }
+        return;
+      }
+      var apiRes = await fetch("/.netlify/functions/claude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "claude-sonnet-4-5", max_tokens: 4000, messages: [{ role: "user", content: prompt }] })
+      });
+      var apiData = await apiRes.json();
+      if (apiData.error) throw new Error("API error: " + apiData.error + (apiData.detail ? " - " + apiData.detail : ""));
+      if (!apiData.content) throw new Error("Unexpected API response: " + JSON.stringify(apiData).substring(0, 200));
+      var raw = apiData.content.map(function(b) { return b.text || ""; }).join("");
+      var matches = JSON.parse(raw.replace(/```json|```/g, "").trim());
+      var today = new Date().toISOString().split("T")[0];
+
+      for (var i = 0; i < matches.length; i++) {
+        var m = matches[i];
+        if (m.showName && !seenNames.includes(m.showName)) {
+          PM.history.push({ recordId: "", showName: m.showName, date: today, applyLink: m.applyLink || "", status: "" });
+          try { await pmAtPost(PM_CONFIG.atHistoryTable, { "Client Email": PM.email, "Name": PM.name, "Show Name": m.showName, "Apply Link": m.applyLink || "", "Date Applied": today }); }
+          catch(e) { console.warn("History write failed", e); }
+        }
+      }
+
+      var emailSent = false;
+      try { await pmSendRecapEmail(matches, today); emailSent = true; }
+      catch(e) { console.warn("Email failed:", e); }
+
+      pmLoadDashboard();
+      pmRenderResults(matches, emailSent);
+      pmShowView("pm-results-view");
+    } catch(e) {
+      pmSetMsg("pm-generate-msg", "Error: " + e.message);
+    }
+    if (btn) { btn.disabled = false; btn.textContent = "Generate my matches"; }
+  }
+
+  function pmRenderResults(matches, emailSent) {
+    var subEl = document.getElementById("pm-results-sub");
+    if (subEl) subEl.textContent = matches.length + " shows where you would be a great guest - all fresh, none you have seen before.";
+    var notice = document.getElementById("pm-email-notice");
+    var noticeText = document.getElementById("pm-email-notice-text");
+    if (emailSent && notice && noticeText) {
+      noticeText.textContent = "A recap has been sent to " + PM.email + " with all your matches and apply links.";
+      notice.style.display = "block";
+    } else if (notice) { notice.style.display = "none"; }
+    var container = document.getElementById("pm-results-container");
+    if (!container) return;
+    container.innerHTML = "";
+    matches.forEach(function(m, i) {
+      var div = document.createElement("div");
+      div.className = "pm-show-card";
+      div.innerHTML = "<div class=\"pm-show-num\">Match " + String(i+1).padStart(2,"0") + "</div>" +
+        "<div class=\"pm-show-name\">" + (m.showName||"Show") + "</div>" +
+        "<div class=\"pm-show-meta\">" +
+          (m.hostName ? "<span>Hosted by " + m.hostName + "</span>" : "") +
+          (m.category ? "<span class=\"pm-badge\">" + m.category + "</span>" : "") +
+          (m.downloads ? "<span>" + m.downloads + " downloads</span>" : "") +
+        "</div><div class=\"pm-divider\"></div>" +
+        "<div class=\"pm-show-why\">" + m.whyFit + "</div>" +
+        (m.applyLink ? "<a class=\"pm-apply\" href=\"" + m.applyLink + "\" target=\"_blank\" rel=\"noopener\">How to apply</a>" : "");
+      container.appendChild(div);
+    });
+  }
+
+  async function pmSendRecapEmail(matches, date) {
+    var cards = matches.map(function(m, i) {
+      return "<div style=\"background:#ffffff;border:1px solid #e8ddd0;border-radius:12px;padding:24px;margin-bottom:16px;\">" +
+        "<p style=\"font-size:11px;letter-spacing:0.1em;text-transform:uppercase;color:#9c8e7e;margin:0 0 6px;\">Match " + String(i+1).padStart(2,"0") + "</p>" +
+        "<p style=\"font-family:Georgia,serif;font-size:20px;color:#151a35;margin:0 0 8px;\">" + (m.showName||"") + "</p>" +
+        "<p style=\"font-size:13px;color:#9c8e7e;margin:0 0 14px;\">" + (m.hostName?"Hosted by "+m.hostName:"") + (m.category?" - "+m.category:"") + (m.downloads?" - "+m.downloads+" downloads":"") + "</p>" +
+        "<p style=\"font-size:14px;color:#2d3561;line-height:1.7;margin:0 0 18px;font-weight:300;\">" + (m.whyFit||"") + "</p>" +
+        (m.applyLink ? "<a href=\"" + m.applyLink + "\" style=\"display:inline-block;font-size:13px;font-weight:500;padding:10px 20px;background:#151a35;color:#faf7f2;border-radius:8px;text-decoration:none;\">How to apply</a>" : "") +
+        "</div>";
+    }).join("");
+    var greeting = PM.name ? "Hi " + PM.name.split(" ")[0] + ", here are your podcast matches" : "Your podcast matches";
+    var html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"></head><body style=\"margin:0;padding:0;background:#faf7f2;font-family:-apple-system,sans-serif;\"><div style=\"max-width:600px;margin:0 auto;padding:40px 20px 60px;\"><div style=\"margin-bottom:32px;\"><p style=\"font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:#c9933a;margin:0 0 12px;\">Need a Guest</p><h1 style=\"font-family:Georgia,serif;font-size:32px;font-weight:400;color:#151a35;margin:0 0 10px;\">" + greeting + "</h1><p style=\"font-size:14px;color:#9c8e7e;margin:0;\">Matched on " + date + "</p></div>" + cards + "<p style=\"font-size:12px;color:#9c8e7e;margin-top:32px;text-align:center;\">Curated by Angel Tuccy - needaguest.com</p></div></body></html>";
+    var res = await fetch("https://" + PM_CONFIG.acUrl + "/api/3/message/send", {
+      method: "POST",
+      headers: { "Api-Token": PM_CONFIG.acKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: { subject: "Your " + matches.length + " podcast matches - " + date, fromemail: PM_CONFIG.acFromEmail, fromname: PM_CONFIG.acFromName, to: [{ email: PM.email, name: PM.name }], html: html } })
+    });
+    if (!res.ok) { var t = await res.text(); throw new Error(t); }
+  }
+
+  async function pmLoadConfig() {
+    try {
+      var res = await fetch("/.netlify/functions/config");
+      var data = await res.json();
+      PM_CONFIG.atToken = data.atToken || "";
+      PM_CONFIG.atBase  = data.atBase  || "";
+      PM_CONFIG.acKey   = data.acKey   || "";
+      PM_CONFIG.acUrl   = data.acUrl   || "";
+    } catch(e) { console.warn("Config load failed", e); }
+  }
+
+  var PM_TEST_MATCHES = [
+    { showName: "The Entrepreneur Mindset Podcast", hostName: "Sarah Chen", category: "Business Growth", downloads: "42,000", applyLink: "https://example.com/apply1", whyFit: "Sarah's audience of early-stage founders would connect deeply with your expertise. Her show seeks actionable guests who can deliver real strategy, and your background as a TEDx speaker makes you a perfect fit." },
+    { showName: "Working Mom Wins", hostName: "Danielle Forte", category: "Lifestyle & Career", downloads: "28,500", applyLink: "https://example.com/apply2", whyFit: "Danielle's listeners are ambitious women balancing career and family — exactly the audience your message resonates with. She actively looks for guests who blend professional credibility with personal authenticity." },
+    { showName: "Scale Smart with Marcus Webb", hostName: "Marcus Webb", category: "Sales & Revenue", downloads: "61,000", applyLink: "https://example.com/apply3", whyFit: "Marcus interviews revenue leaders for B2B executives, a perfect match for your sales credentials. His conversational format plays to your strengths as a speaker." },
+    { showName: "Mindset and Money", hostName: "Priya Nair", category: "Mindset", downloads: "19,000", applyLink: "https://example.com/apply4", whyFit: "Priya's listeners are ambitious professionals working on financial mindset and personal growth. Your story of turning expertise into a thriving business would resonate deeply." },
+    { showName: "The Growth Lab", hostName: "James Okafor", category: "Business", downloads: "35,000", applyLink: "https://example.com/apply5", whyFit: "James focuses on practical growth strategies for online businesses. Your frameworks and credentials make you an ideal guest for his evidence-driven audience." },
+    { showName: "Women Who Lead", hostName: "Tara Mills", category: "Leadership", downloads: "22,000", applyLink: "https://example.com/apply6", whyFit: "Tara's show celebrates women in leadership and entrepreneurship. Your journey and expertise are exactly the kind of story her audience tunes in for." },
+    { showName: "Revenue Rebels", hostName: "Chris Domino", category: "Sales", downloads: "44,000", applyLink: "https://example.com/apply7", whyFit: "Chris interviews unconventional thinkers in sales and revenue growth. Your unique approach and real-world results make you a standout guest candidate." },
+    { showName: "The Inspired Entrepreneur", hostName: "Leila Haddad", category: "Entrepreneurship", downloads: "31,000", applyLink: "https://example.com/apply8", whyFit: "Leila's audience is looking for inspiration backed by action. Your credentials and storytelling style are a natural fit for her interview format." },
+    { showName: "Bold Business Daily", hostName: "Mike Sutton", category: "Business", downloads: "58,000", applyLink: "https://example.com/apply9", whyFit: "Mike covers bold moves in business with a focus on real results. Your background gives you plenty of compelling stories that would engage his large audience." },
+    { showName: "The Hustle Blueprint", hostName: "Nia James", category: "Entrepreneurship", downloads: "17,500", applyLink: "https://example.com/apply10", whyFit: "Nia's show is built for early-stage entrepreneurs who want a blueprint for success. Your practical frameworks are exactly what her audience is looking for." },
+    { showName: "Smart Money Moves", hostName: "David Park", category: "Finance", downloads: "29,000", applyLink: "https://example.com/apply11", whyFit: "David's listeners want actionable financial and business advice. Your expertise bridges both worlds in a way that would give this audience immediate value." },
+    { showName: "The Visibility Podcast", hostName: "Carmen Ruiz", category: "Marketing", downloads: "24,000", applyLink: "https://example.com/apply12", whyFit: "Carmen helps entrepreneurs get visible and grow their brand. Your TEDx experience and media presence make you a credible and inspiring guest for her audience." }
+  ];
+
+  function tryInit() {
+    if (document.getElementById("pm-login-btn")) {
+      pmLoadConfig().then(function() { init(); });
+    } else {
+      setTimeout(tryInit, 100);
+    }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", tryInit);
+  } else {
+    tryInit();
+  }
+
+})();
+</script>
+
+</body>
+</html><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Podcast Match - Need a Guest</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'DM Sans', sans-serif; background: #faf7f2; color: #151a35; min-height: 100vh; font-size: 15px; line-height: 1.6; }
+header { padding: 20px 40px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #e8ddd0; background: #fff9f3; }
+.logo { font-family: 'DM Serif Display', serif; font-size: 20px; color: #151a35; }
+.logo span { color: #c9933a; font-style: italic; }
+.header-right { display: flex; align-items: center; gap: 14px; }
+.header-user { font-size: 13px; color: #6b7280; display: none; }
+.btn-logout { font-size: 12px; color: #6b7280; background: none; border: 1px solid #e8ddd0; border-radius: 6px; padding: 5px 12px; cursor: pointer; font-family: 'DM Sans', sans-serif; display: none; transition: color 0.2s; }
+.btn-logout:hover { color: #151a35; }
+#pm-wrap { max-width: 780px; margin: 0 auto; padding: 48px 24px 80px; }
+.pm-view { display: none; }
+.pm-view.active { display: block; }
+.pm-deco { width: 40px; height: 2px; background: #c9933a; margin-bottom: 16px; }
+.pm-eyebrow { font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase; color: #c9933a; margin-bottom: 8px; display: block; }
+.pm-title { font-family: 'DM Serif Display', serif; font-size: 36px; line-height: 1.15; color: #151a35; margin: 0 0 10px; letter-spacing: -0.02em; }
+.pm-title em { font-style: italic; color: #c9933a; }
+.pm-sub { font-size: 15px; color: #6b7280; margin: 0 0 28px; font-weight: 300; }
+.pm-card { background: #fff; border: 1px solid #e8ddd0; border-radius: 14px; padding: 28px; margin-bottom: 16px; }
+.pm-card label { display: block; font-size: 11px; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: #6b7280; margin: 16px 0 6px; }
+.pm-card label:first-child { margin-top: 0; }
+.pm-card input[type="text"],
+.pm-card input[type="email"],
+.pm-card textarea { width: 100%; padding: 11px 14px; border: 1px solid #e8ddd0; border-radius: 8px; font-family: 'DM Sans', sans-serif; font-size: 15px; color: #151a35; background: #faf7f2; outline: none; transition: border-color 0.2s; }
+.pm-card input:focus, .pm-card textarea:focus { border-color: #c9933a; box-shadow: 0 0 0 3px rgba(201,147,58,0.1); }
+.pm-card textarea { resize: vertical; line-height: 1.6; }
+.pm-btn { display: block; width: 100%; padding: 13px 20px; margin-top: 20px; background: #151a35; color: #faf7f2; border: none; border-radius: 8px; font-family: 'DM Sans', sans-serif; font-size: 15px; font-weight: 500; cursor: pointer; transition: background 0.2s; text-align: center; }
+.pm-btn:hover { background: #1e2548; }
+.pm-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.pm-btn-outline { background: transparent; color: #151a35; border: 1px solid #e8ddd0; }
+.pm-btn-outline:hover { background: #f5f0ea; border-color: #c9b99a; }
+.pm-btn-gold { background: #c9933a; font-family: 'DM Serif Display', serif; font-style: italic; font-size: 18px; }
+.pm-btn-gold:hover { background: #b5822e; }
+.pm-btn-sm { width: auto; display: inline-block; padding: 7px 14px; font-size: 13px; margin-top: 12px; }
+.pm-msg-error { font-size: 13px; color: #b85c38; margin-top: 8px; }
+.pm-msg-ok { font-size: 13px; color: #3a6e3a; margin-top: 8px; }
+.pm-spinner { display: inline-block; width: 13px; height: 13px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: pm-spin 0.7s linear infinite; vertical-align: middle; margin-right: 6px; }
+@keyframes pm-spin { to { transform: rotate(360deg); } }
+.pm-back { font-size: 13px; color: #6b7280; cursor: pointer; margin-bottom: 24px; display: inline-block; }
+.pm-back:hover { color: #151a35; }
+.pm-grid { display: grid; grid-template-columns: 220px 1fr; gap: 20px; align-items: start; }
+.pm-sidebar { background: #fff; border: 1px solid #e8ddd0; border-radius: 14px; padding: 22px; }
+.pm-sidebar-title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #6b7280; margin-bottom: 14px; }
+.pm-field { margin-bottom: 12px; }
+.pm-field-label { font-size: 10px; letter-spacing: 0.07em; text-transform: uppercase; color: #9ca3af; margin-bottom: 2px; }
+.pm-field-value { font-size: 13px; color: #2d3561; line-height: 1.5; }
+.pm-generate-box { background: #151a35; border-radius: 14px; padding: 28px; margin-bottom: 20px; text-align: center; }
+.pm-generate-title { font-family: 'DM Serif Display', serif; font-size: 22px; color: #faf7f2; margin-bottom: 6px; }
+.pm-generate-title em { color: #c9933a; font-style: italic; }
+.pm-generate-sub { font-size: 13px; color: rgba(250,247,242,0.55); margin-bottom: 18px; }
+.pm-stats { display: flex; justify-content: center; gap: 32px; margin-bottom: 18px; }
+.pm-stat-num { font-family: 'DM Serif Display', serif; font-size: 26px; color: #c9933a; }
+.pm-stat-label { font-size: 10px; color: rgba(250,247,242,0.45); text-transform: uppercase; letter-spacing: 0.08em; }
+.pm-generate-msg { font-size: 13px; color: rgba(250,247,242,0.6); margin-top: 10px; }
+.pm-history-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.pm-history-title { font-size: 13px; font-weight: 500; color: #151a35; }
+.pm-history-count { font-size: 12px; color: #9ca3af; }
+.pm-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.pm-table th { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: #9ca3af; padding: 6px 10px; text-align: left; border-bottom: 1px solid #e8ddd0; }
+.pm-table td { color: #2d3561; padding: 9px 10px; border-bottom: 1px solid #f0e8de; }
+.pm-table tr:last-child td { border-bottom: none; }
+.pm-table a { color: #a07830; font-weight: 500; text-decoration: none; }
+.pm-table a:hover { text-decoration: underline; }
+.pm-empty { font-size: 13px; color: #9ca3af; text-align: center; padding: 28px; font-style: italic; }
+.pm-show-card { background: #fff; border: 1px solid #e8ddd0; border-radius: 14px; padding: 24px; margin-bottom: 14px; transition: box-shadow 0.2s, transform 0.2s; }
+.pm-show-card:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(21,26,53,0.1); }
+.pm-show-num { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: #9ca3af; margin-bottom: 4px; }
+.pm-show-name { font-family: 'DM Serif Display', serif; font-size: 19px; color: #151a35; margin-bottom: 6px; }
+.pm-show-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; font-size: 12px; color: #9ca3af; }
+.pm-badge { font-size: 11px; padding: 2px 9px; border-radius: 99px; background: rgba(201,147,58,0.1); color: #a07830; font-weight: 500; }
+.pm-divider { height: 1px; background: #f0e8de; margin: 12px 0; }
+.pm-show-why { font-size: 14px; color: #4a5568; line-height: 1.7; margin-bottom: 16px; }
+.pm-apply { display: inline-block; font-size: 13px; font-weight: 500; padding: 8px 16px; background: #151a35; color: #faf7f2; border-radius: 7px; text-decoration: none; transition: background 0.2s; }
+.pm-apply:hover { background: #1e2548; }
+.pm-email-notice { background: #f0faf0; border: 1px solid #c8e6c8; border-radius: 8px; padding: 11px 14px; font-size: 13px; color: #3a6e3a; margin-bottom: 20px; }
+@media (max-width: 620px) {
+  header { padding: 16px 20px; }
+  .pm-grid { grid-template-columns: 1fr; }
+  .pm-title { font-size: 26px; }
+  #pm-wrap { padding: 32px 16px 60px; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Need a <span>Guest</span></div>
+  <div class="header-right">
+    <span class="header-user" id="pm-header-user"></span>
+    <button class="btn-logout" id="pm-logout-btn">Log out</button>
+  </div>
+</header>
+<div id="pm-test-banner" style="background:#b85c38;color:#fff;text-align:center;padding:6px;font-size:12px;font-family:DM Sans,sans-serif;display:none">
+  TEST MODE — fake matches, no API calls &nbsp;·&nbsp; <span style="cursor:pointer;text-decoration:underline" onclick="document.getElementById('pm-test-banner').style.display='none';window.PM_TEST=false">disable</span>
+</div>
+
+<div id="pm-wrap">
+
+  <div id="pm-login-view" class="pm-view active">
+    <div class="pm-deco"></div>
+    <span class="pm-eyebrow">Podcast Match</span>
+    <h1 class="pm-title">Find your next <em>perfect</em> show.</h1>
+    <p class="pm-sub">Enter your email to access your podcast matching dashboard.</p>
+    <div class="pm-card">
+      <label>Your email address</label>
+      <input type="email" id="pm-login-email" placeholder="you@example.com" />
+      <button class="pm-btn" id="pm-login-btn">Continue</button>
+      <div id="pm-login-msg"></div>
+    </div>
+  </div>
+
+  <div id="pm-profile-view" class="pm-view">
+    <span class="pm-back pm-back-dashboard">Back to dashboard</span>
+    <div class="pm-deco"></div>
+    <span class="pm-eyebrow">Your Profile</span>
+    <h1 class="pm-title">Let's set you <em>up.</em></h1>
+    <p class="pm-sub">Fill this in once and we will use it every time you generate matches.</p>
+    <div class="pm-card">
+      <label>Your topic / niche</label>
+      <input type="text" id="pm-profile-topic" placeholder="e.g. business growth, mindset, sales" />
+      <label>Your target audience</label>
+      <input type="text" id="pm-profile-audience" placeholder="e.g. entrepreneurs, working moms, executives" />
+      <label>Your credentials / background</label>
+      <input type="text" id="pm-profile-creds" placeholder="e.g. 15 years in sales, author, TEDx speaker" />
+      <label>Episode format preferences</label>
+      <input type="text" id="pm-profile-format" placeholder="e.g. interview, panel, solo guest, storytelling" />
+      <label>Anything else we should know?</label>
+      <textarea id="pm-profile-other" rows="3" placeholder="Optional"></textarea>
+      <button class="pm-btn" id="pm-save-profile-btn">Save profile and go to dashboard</button>
+      <div id="pm-profile-msg"></div>
+    </div>
+  </div>
+
+  <div id="pm-dashboard-view" class="pm-view">
+    <div class="pm-deco"></div>
+    <span class="pm-eyebrow">Dashboard</span>
+    <h1 class="pm-title" id="pm-dash-title">Your <em>dashboard.</em></h1>
+    <div class="pm-grid">
+      <div>
+        <div class="pm-sidebar">
+          <div class="pm-sidebar-title">Your Profile</div>
+          <div class="pm-field"><div class="pm-field-label">Topic</div><div class="pm-field-value" id="pm-p-topic"></div></div>
+          <div class="pm-field"><div class="pm-field-label">Audience</div><div class="pm-field-value" id="pm-p-audience"></div></div>
+          <div class="pm-field"><div class="pm-field-label">Credentials</div><div class="pm-field-value" id="pm-p-creds"></div></div>
+          <div class="pm-field"><div class="pm-field-label">Format</div><div class="pm-field-value" id="pm-p-format"></div></div>
+          <div class="pm-field"><div class="pm-field-label">Other</div><div class="pm-field-value" id="pm-p-other"></div></div>
+          <button class="pm-btn pm-btn-outline pm-btn-sm" id="pm-edit-profile-btn">Edit profile</button>
+        </div>
+      </div>
+      <div>
+        <div class="pm-generate-box">
+          <div class="pm-generate-title">Ready for <em>new matches?</em></div>
+          <div class="pm-generate-sub">We will find 12 fresh shows you have not seen yet.</div>
+          <div class="pm-stats">
+            <div><div class="pm-stat-num" id="pm-stat-matched">0</div><div class="pm-stat-label">Shows matched</div></div>
+            <div><div class="pm-stat-num" id="pm-stat-remaining">0</div><div class="pm-stat-label">Still available</div></div>
+          </div>
+          <button class="pm-btn pm-btn-gold" id="pm-generate-btn"><svg width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align:middle;margin-right:8px"><rect x="10" y="7" width="2.5" height="12" rx="1.25" fill="#e8ddd0"/><circle cx="11.25" cy="4.5" r="3.5" fill="#e05a2b"/><circle cx="11.25" cy="4.5" r="2" fill="#f07840"/></svg>Generate my matches</button>
+          <div class="pm-generate-msg" id="pm-generate-msg"></div>
+          <div style="margin-top:10px"><span onclick="window.PM_TEST=true;document.getElementById('pm-test-banner').style.display='block'" style="font-size:11px;color:rgba(250,247,242,0.3);cursor:pointer;text-decoration:underline">test mode</span></div>
+        </div>
+        <div class="pm-card">
+          <div class="pm-history-header">
+            <div class="pm-history-title">Match History</div>
+            <div class="pm-history-count" id="pm-history-count"></div>
+          </div>
+          <div id="pm-history-container"><div class="pm-empty">No matches yet - hit generate to get started.</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="pm-results-view" class="pm-view">
+    <span class="pm-back pm-back-dashboard">Back to dashboard</span>
+    <div class="pm-deco"></div>
+    <span class="pm-eyebrow">Your Matches</span>
+    <h1 class="pm-title">Shows made <em>for you.</em></h1>
+    <p class="pm-sub" id="pm-results-sub"></p>
+    <div id="pm-email-notice" style="display:none" class="pm-email-notice"><span id="pm-email-notice-text"></span></div>
+    <div id="pm-results-container"></div>
+    <button class="pm-btn pm-btn-outline pm-back-dashboard" style="margin-top:8px">Back to dashboard</button>
+  </div>
+
+</div>
+
+<script>
+(function() {
+  var PM_CONFIG = {
+    atToken:        "",
+    atBase:         "",
+    atShowsTable:   "Podcast Directory",
+    atClientsTable: "Match Clients",
+    atHistoryTable: "Match History",
+    acKey:          "",
+    acUrl:          "",
+    acFromName:     "Angel Tuccy",
+    acFromEmail:    "help@needaguest.com"
+  };
+
+  var PM = { email: "", name: "", recordId: "", profile: {}, history: [], showsTotal: 0 };
+
+  function init() {
+    var loginBtn       = document.getElementById("pm-login-btn");
+    var saveProfileBtn = document.getElementById("pm-save-profile-btn");
+    var generateBtn    = document.getElementById("pm-generate-btn");
+    var logoutBtn      = document.getElementById("pm-logout-btn");
+    var editProfileBtn = document.getElementById("pm-edit-profile-btn");
+    var loginEmail     = document.getElementById("pm-login-email");
+    var backBtns       = document.querySelectorAll(".pm-back-dashboard");
+
+    if (loginBtn)       loginBtn.addEventListener("click", pmLogin);
+    if (saveProfileBtn) saveProfileBtn.addEventListener("click", pmSaveProfile);
+    if (generateBtn)    generateBtn.addEventListener("click", pmGenerateMatches);
+    if (logoutBtn)      logoutBtn.addEventListener("click", pmLogout);
+    if (editProfileBtn) editProfileBtn.addEventListener("click", pmEditProfile);
+    if (loginEmail)     loginEmail.addEventListener("keydown", function(e) { if (e.key === "Enter") pmLogin(); });
+    backBtns.forEach(function(b) { b.addEventListener("click", function() { pmShowView("pm-dashboard-view"); }); });
+  }
+
+  function pmShowView(id) {
+    document.querySelectorAll("#pm-wrap .pm-view").forEach(function(v) { v.classList.remove("active"); });
+    var el = document.getElementById(id);
+    if (el) el.classList.add("active");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function pmLogout() {
+    PM.email = ""; PM.name = ""; PM.recordId = ""; PM.profile = {}; PM.history = [];
+    var hu = document.getElementById("pm-header-user");
+    var lb = document.getElementById("pm-logout-btn");
+    var hr = document.getElementById("pm-header-row");
+    if (hu) hu.style.display = "none";
+    if (lb) lb.style.display = "none";
+    if (hr) hr.style.display = "none";
+    var em = document.getElementById("pm-login-email");
+    if (em) em.value = "";
+    pmShowView("pm-login-view");
+  }
+
+  function pmSetMsg(id, html) {
+    var el = document.getElementById(id);
+    if (el) el.innerHTML = html;
+  }
+
+  async function pmAtGet(table, params) {
+    params = params || "";
+    var res = await fetch("https://api.airtable.com/v0/" + PM_CONFIG.atBase + "/" + encodeURIComponent(table) + params, {
+      headers: { Authorization: "Bearer " + PM_CONFIG.atToken }
+    });
+    if (!res.ok) throw new Error("Airtable error " + res.status);
+    return res.json();
+  }
+
+  async function pmAtPost(table, fields) {
+    var res = await fetch("https://api.airtable.com/v0/" + PM_CONFIG.atBase + "/" + encodeURIComponent(table), {
+      method: "POST",
+      headers: { Authorization: "Bearer " + PM_CONFIG.atToken, "Content-Type": "application/json" },
+      body: JSON.stringify({ records: [{ fields: fields }] })
+    });
+    if (!res.ok) throw new Error("Airtable error " + res.status);
+    return res.json();
+  }
+
+  async function pmAtPatch(table, recordId, fields) {
+    var res = await fetch("https://api.airtable.com/v0/" + PM_CONFIG.atBase + "/" + encodeURIComponent(table) + "/" + recordId, {
+      method: "PATCH",
+      headers: { Authorization: "Bearer " + PM_CONFIG.atToken, "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: fields })
+    });
+    if (!res.ok) throw new Error("Airtable error " + res.status);
+    return res.json();
+  }
+
+  async function pmGetAllRecords(table) {
+    var all = [], offset = null;
+    do {
+      var url = "https://api.airtable.com/v0/" + PM_CONFIG.atBase + "/" + encodeURIComponent(table) + (offset ? "?offset=" + offset : "");
+      var res = await fetch(url, { headers: { Authorization: "Bearer " + PM_CONFIG.atToken } });
+      if (!res.ok) throw new Error("Airtable error " + res.status);
+      var d = await res.json();
+      all = all.concat(d.records);
+      offset = d.offset;
+    } while (offset);
+    return all;
+  }
+
+  async function pmLogin() {
+    var emailEl = document.getElementById("pm-login-email");
+    var email = emailEl ? emailEl.value.trim().toLowerCase() : "";
+    if (!email || !email.includes("@")) {
+      pmSetMsg("pm-login-msg", "<p class=\"pm-msg-error\">Please enter a valid email.</p>"); return;
+    }
+    var btn = document.getElementById("pm-login-btn");
+    if (btn) { btn.disabled = true; btn.innerHTML = "<span class=\"pm-spinner\"></span>Checking..."; }
+    pmSetMsg("pm-login-msg", "");
+    try {
+      var formula = encodeURIComponent("LOWER({Email})=\"" + email + "\"");
+      var data = await pmAtGet(PM_CONFIG.atClientsTable, "?filterByFormula=" + formula);
+      if (!data.records || data.records.length === 0) {
+        pmSetMsg("pm-login-msg", "<p class=\"pm-msg-error\">Email not found. Please contact Angel to get access.</p>");
+        if (btn) { btn.disabled = false; btn.innerHTML = "Continue"; } return;
+      }
+      var rec = data.records[0];
+      PM.email    = email;
+      PM.recordId = rec.id;
+      PM.name     = rec.fields["Name"] || "";
+      PM.profile  = {
+        topic:    rec.fields["Topic"] || "",
+        audience: rec.fields["Audience"] || "",
+        creds:    rec.fields["Credentials"] || "",
+        format:   rec.fields["Format"] || "",
+        other:    rec.fields["Other"] || ""
+      };
+      var hist = await pmGetAllRecords(PM_CONFIG.atHistoryTable);
+      PM.history = hist
+        .filter(function(r) { return (r.fields["Client Email"] || "").toLowerCase() === email; })
+        .map(function(r) { return { recordId: r.id, showName: r.fields["Show Name"], date: r.fields["Date Applied"], applyLink: r.fields["Apply Link"] || "", status: r.fields["Status"] || "" }; });
+      var shows = await pmGetAllRecords(PM_CONFIG.atShowsTable);
+      PM.showsTotal = shows.length;
+
+      var hu = document.getElementById("pm-header-user");
+      var lb = document.getElementById("pm-logout-btn");
+      var hr = document.getElementById("pm-header-row");
+      if (hu) { hu.textContent = PM.name || PM.email; hu.style.display = "inline"; }
+      if (lb) lb.style.display = "inline-block";
+      if (hr) hr.style.display = "flex";
+
+      if (!PM.profile.topic && !PM.profile.audience && !PM.profile.creds) {
+        pmShowView("pm-profile-view");
+      } else {
+        pmLoadDashboard();
+        pmShowView("pm-dashboard-view");
+      }
+    } catch(e) {
+      pmSetMsg("pm-login-msg", "<p class=\"pm-msg-error\">Error: " + e.message + "</p>");
+    }
+    if (btn) { btn.disabled = false; btn.innerHTML = "Continue"; }
+  }
+
+  async function pmSaveProfile() {
+    var topic    = (document.getElementById("pm-profile-topic")    || {value:""}).value.trim();
+    var audience = (document.getElementById("pm-profile-audience") || {value:""}).value.trim();
+    var creds    = (document.getElementById("pm-profile-creds")    || {value:""}).value.trim();
+    var format   = (document.getElementById("pm-profile-format")   || {value:""}).value.trim();
+    var other    = (document.getElementById("pm-profile-other")    || {value:""}).value.trim();
+    if (!topic) { pmSetMsg("pm-profile-msg", "<p class=\"pm-msg-error\">Please enter your topic or niche.</p>"); return; }
+    var btn = document.getElementById("pm-save-profile-btn");
+    if (btn) { btn.disabled = true; btn.innerHTML = "<span class=\"pm-spinner\"></span>Saving..."; }
+    try {
+      await pmAtPatch(PM_CONFIG.atClientsTable, PM.recordId, { Topic: topic, Audience: audience, Credentials: creds, Format: format, Other: other });
+      PM.profile = { topic: topic, audience: audience, creds: creds, format: format, other: other };
+      pmLoadDashboard();
+      pmShowView("pm-dashboard-view");
+    } catch(e) {
+      pmSetMsg("pm-profile-msg", "<p class=\"pm-msg-error\">Error saving: " + e.message + "</p>");
+    }
+    if (btn) { btn.disabled = false; btn.innerHTML = "Save profile and go to dashboard"; }
+  }
+
+  function pmEditProfile() {
+    ["topic","audience","creds","format","other"].forEach(function(f) {
+      var el = document.getElementById("pm-profile-" + f);
+      if (el) el.value = PM.profile[f] || "";
+    });
+    var btn = document.getElementById("pm-save-profile-btn");
+    if (btn) btn.textContent = "Save changes";
+    pmShowView("pm-profile-view");
+  }
+
+  function pmLoadDashboard() {
+    var first = PM.name ? PM.name.split(" ")[0] : "";
+    var titleEl = document.getElementById("pm-dash-title");
+    if (titleEl) titleEl.innerHTML = first ? "Welcome back, <em>" + first + ".</em>" : "Your <em>dashboard.</em>";
+    var map = { topic:"pm-p-topic", audience:"pm-p-audience", creds:"pm-p-creds", format:"pm-p-format", other:"pm-p-other" };
+    Object.keys(map).forEach(function(k) {
+      var el = document.getElementById(map[k]);
+      if (el) el.textContent = PM.profile[k] || "-";
+    });
+    var sm = document.getElementById("pm-stat-matched");
+    var sr = document.getElementById("pm-stat-remaining");
+    if (sm) sm.textContent = PM.history.length;
+    if (sr) sr.textContent = Math.max(0, PM.showsTotal - PM.history.length);
+    pmRenderHistory();
+  }
+
+  var PM_HISTORY_PAGE = 0;
+  var PM_HISTORY_PER_PAGE = 12;
+
+  function pmRenderHistory() {
+    var container = document.getElementById("pm-history-container");
+    var countEl   = document.getElementById("pm-history-count");
+    if (!container) return;
+    if (countEl) countEl.textContent = PM.history.length ? PM.history.length + " shows" : "";
+    if (PM.history.length === 0) {
+      container.innerHTML = "<div class=\"pm-empty\">No matches yet - hit generate to get started.</div>"; return;
+    }
+    var sorted = PM.history.slice().reverse();
+    var totalPages = Math.ceil(sorted.length / PM_HISTORY_PER_PAGE);
+    if (PM_HISTORY_PAGE >= totalPages) PM_HISTORY_PAGE = totalPages - 1;
+    var start = PM_HISTORY_PAGE * PM_HISTORY_PER_PAGE;
+    var page = sorted.slice(start, start + PM_HISTORY_PER_PAGE);
+    var statuses = ["Applied","Accepted","Scheduled","Recorded","Published","Declined"];
+    var statusColors = { Applied:"#2d3561", Accepted:"#3a6e3a", Scheduled:"#c9933a", Recorded:"#6b7280", Published:"#151a35", Declined:"#b85c38" };
+    var rows = page.map(function(h, i) {
+      var globalIdx = sorted.length - 1 - (start + i);
+      var statusOpts = statuses.map(function(s) {
+        return "<option value=\"" + s + "\"" + (h.status === s ? " selected" : "") + ">" + s + "</option>";
+      }).join("");
+      return "<tr>" +
+        "<td>" + (h.showName||"-") + "</td>" +
+        "<td>" + (h.date||"-") + "</td>" +
+        "<td><select class=\"pm-status-select\" data-idx=\"" + globalIdx + "\" style=\"font-size:12px;padding:3px 6px;border-radius:6px;border:1px solid #e8ddd0;background:#faf7f2;color:" + (statusColors[h.status]||"#6b7280") + ";font-family:inherit;cursor:pointer\">" +
+        "<option value=\"\">Set status</option>" + statusOpts + "</select></td>" +
+        "<td>" + (h.applyLink ? "<a href=\"" + h.applyLink + "\" target=\"_blank\">Apply</a>" : "") + "</td>" +
+        "</tr>";
+    }).join("");
+    var pagination = totalPages > 1 ?
+      "<div style=\"display:flex;align-items:center;justify-content:space-between;margin-top:14px;font-size:13px;color:#6b7280\">" +
+        "<span style=\"cursor:pointer;padding:4px 10px;border:1px solid #e8ddd0;border-radius:6px" + (PM_HISTORY_PAGE === 0 ? ";opacity:0.3;pointer-events:none" : "") + "\" onclick=\"PM_HISTORY_PAGE--;pmRenderHistory()\">Prev</span>" +
+        "<span>Page " + (PM_HISTORY_PAGE+1) + " of " + totalPages + "</span>" +
+        "<span style=\"cursor:pointer;padding:4px 10px;border:1px solid #e8ddd0;border-radius:6px" + (PM_HISTORY_PAGE >= totalPages-1 ? ";opacity:0.3;pointer-events:none" : "") + "\" onclick=\"PM_HISTORY_PAGE++;pmRenderHistory()\">Next</span>" +
+      "</div>" : "";
+    container.innerHTML =
+      "<table class=\"pm-table\"><thead><tr><th>Show</th><th>Date</th><th>Status</th><th></th></tr></thead><tbody>" + rows + "</tbody></table>" + pagination;
+    container.querySelectorAll(".pm-status-select").forEach(function(sel) {
+      sel.addEventListener("change", function() {
+        var idx = parseInt(this.getAttribute("data-idx"));
+        var newStatus = this.value;
+        this.style.color = statusColors[newStatus] || "#6b7280";
+        PM.history[idx].status = newStatus;
+        var recordId = PM.history[idx].recordId;
+        if (recordId) {
+          pmAtPatch(PM_CONFIG.atHistoryTable, recordId, { Status: newStatus }).catch(function(e) { console.warn("Status update failed", e); });
+        }
+      });
+    });
+  }
+
+  async function pmGenerateMatches() {
+    if (!PM.profile.topic) { pmEditProfile(); return; }
+    var btn = document.getElementById("pm-generate-btn");
+    if (btn) { btn.disabled = true; btn.textContent = "Finding your matches..."; }
+    pmSetMsg("pm-generate-msg", "");
+    try {
+      var shows = await pmGetAllRecords(PM_CONFIG.atShowsTable);
+      PM.showsTotal = shows.length;
+      var seenNames = PM.history.map(function(h) { return h.showName; });
+      var available = shows.filter(function(s) { return !seenNames.includes(s.fields["Show Name"]); });
+      if (available.length === 0) {
+        pmSetMsg("pm-generate-msg", "You have been matched with all available shows. Contact Angel for new additions.");
+        if (btn) { btn.disabled = false; btn.textContent = "Generate my matches"; } return;
+      }
       var showList = available.map(function(s) {
         var f = s.fields;
         return "- Show: "+(f["Show Name"]||"")+" | Host: "+(f["Host Name"]||"")+" | Category: "+(f["Category"]||"")+" | Downloads: "+(f["Download #s"]||f["Downloads"]||"")+" | Desired guests: "+(f["Desired Guests and Conversation Type"]||"")+" | Apply: "+(f["How to Apply Link"]||f["How to Apply"]||"");
