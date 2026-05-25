@@ -483,7 +483,7 @@ header { padding: 20px 40px; display: flex; align-items: center; justify-content
       var apiRes = await fetch("/.netlify/functions/claude", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "claude-sonnet-4-5", max_tokens: 1000, messages: [{ role: "user", content: prompt }] })
+        body: JSON.stringify({ model: "claude-sonnet-4-5", max_tokens: 10000, messages: [{ role: "user", content: prompt }] })
       });
       var apiData = await apiRes.json();
       if (apiData.error) throw new Error("API error: " + apiData.error + (apiData.detail ? " - " + apiData.detail : ""));
