@@ -494,13 +494,16 @@ header { padding: 20px 40px; display: flex; align-items: center; justify-content
       if (!apiData.content) throw new Error("Unexpected API response: " + JSON.stringify(apiData).substring(0, 200));
       var raw = apiData.content.map(function(b) { return b.text || ""; }).join("");
       var matches = JSON.parse(raw.replace(/```json|```/g, "").trim());
-      var today = new Date().toISOString().split("T")[0];
+      var today = new Date().toISOString().split("T")[0]; var todayFull = today + "T00:00:00.000Z";
 
+      if (!PM_CONFIG.atToken) {
+        pmSetMsg("pm-generate-msg", "Warning: could not save match history - config not loaded.");
+      }
       for (var i = 0; i < matches.length; i++) {
         var m = matches[i];
         if (m.showName && !seenNames.includes(m.showName)) {
           PM.history.push({ recordId: "", showName: m.showName, date: today, applyLink: m.applyLink || "", status: "" });
-          try { await pmAtPost(PM_CONFIG.atHistoryTable, { "Client Email": PM.email, "Name": PM.name, "Show Name": m.showName, "Apply Link": m.applyLink || "", "Date Applied": today }); }
+          try { await pmAtPost(PM_CONFIG.atHistoryTable, (function(){ var rec = { "Client Email": PM.email, "Name": PM.name, "Show Name": m.showName, "Date Applied": todayFull }; if (m.applyLink) rec["Apply Link"] = m.applyLink; return rec; })()); }
           catch(e) {
             console.warn("History write failed", e);
             pmSetMsg("pm-generate-msg", "Match history could not be saved: " + e.message);
