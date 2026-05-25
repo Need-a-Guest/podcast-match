@@ -192,6 +192,9 @@ header { padding: 20px 40px; display: flex; align-items: center; justify-content
 </div>
 
 <script>
+var PM_HISTORY_PAGE = 0;
+var PM_HISTORY_PER_PAGE = 12;
+
 (function() {
   var PM_CONFIG = {
     atToken:        "",
@@ -391,8 +394,7 @@ header { padding: 20px 40px; display: flex; align-items: center; justify-content
     pmRenderHistory();
   }
 
-  var PM_HISTORY_PAGE = 0;
-  var PM_HISTORY_PER_PAGE = 12;
+
 
   function pmRenderHistory() {
     var container = document.getElementById("pm-history-container");
@@ -464,7 +466,8 @@ header { padding: 20px 40px; display: flex; align-items: center; justify-content
       var sampled = available.slice().sort(function() { return Math.random() - 0.5; }).slice(0, sampleSize);
       var showList = sampled.map(function(s) {
         var f = s.fields;
-        return (f["Show Name"]||"?") + "|" + (f["Category"]||"?") + "|" + (f["Desired Guests and Conversation Type"]||"?") + "|" + (f["How to Apply Link"]||f["How to Apply"]||"");
+        var guests = (f["Desired Guests and Conversation Type"]||"").substring(0, 60);
+        return "Show: "+(f["Show Name"]||"")+" | Cat: "+(f["Category"]||"")+" | Guests: "+guests+" | Apply: "+(f["How to Apply Link"]||f["How to Apply"]||"");
       }).join("\n");
 
       var prompt = "You are a podcast booking expert working for Angel Tuccy at Need a Guest.\n\nGUEST PROFILE:\n- Topic/niche: "+PM.profile.topic+"\n- Target audience: "+PM.profile.audience+"\n- Credentials/background: "+PM.profile.creds+"\n- Format preferences: "+PM.profile.format+"\n- Additional context: "+PM.profile.other+"\n\nAVAILABLE SHOWS (format: ShowName|Category|DesiredGuests|ApplyLink):\n"+showList+"\n\nSelect exactly 12 shows (or fewer if less than 12 available) that are the best fit. For each, write a warm specific 2-3 sentence explanation of why this guest would be a great fit.\n\nRespond ONLY with a valid JSON array, no markdown, no preamble:\n[{\"showName\":\"...\",\"hostName\":\"...\",\"category\":\"...\",\"downloads\":\"...\",\"applyLink\":\"...\",\"whyFit\":\"...\"}]";
@@ -564,9 +567,9 @@ header { padding: 20px 40px; display: flex; align-items: center; justify-content
     }).join("");
     var greeting = PM.name ? "Hi " + PM.name.split(" ")[0] + ", here are your podcast matches" : "Your podcast matches";
     var html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"></head><body style=\"margin:0;padding:0;background:#faf7f2;font-family:-apple-system,sans-serif;\"><div style=\"max-width:600px;margin:0 auto;padding:40px 20px 60px;\"><div style=\"margin-bottom:32px;\"><p style=\"font-size:11px;letter-spacing:0.15em;text-transform:uppercase;color:#c9933a;margin:0 0 12px;\">Need a Guest</p><h1 style=\"font-family:Georgia,serif;font-size:32px;font-weight:400;color:#151a35;margin:0 0 10px;\">" + greeting + "</h1><p style=\"font-size:14px;color:#9c8e7e;margin:0;\">Matched on " + date + "</p></div>" + cards + "<p style=\"font-size:12px;color:#9c8e7e;margin-top:32px;text-align:center;\">Curated by Angel Tuccy - needaguest.com</p></div></body></html>";
-    var res = await fetch("https://" + PM_CONFIG.acUrl + "/api/3/message/send", {
+    var res = await fetch("/.netlify/functions/email", {
       method: "POST",
-      headers: { "Api-Token": PM_CONFIG.acKey, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ message: { subject: "Your " + matches.length + " podcast matches - " + date, fromemail: PM_CONFIG.acFromEmail, fromname: PM_CONFIG.acFromName, to: [{ email: PM.email, name: PM.name }], html: html } })
     });
     if (!res.ok) { var t = await res.text(); throw new Error(t); }
